@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>ReFrect Prototype</title>
+  <style>
+    body {
+      margin: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      background: radial-gradient(circle at top, #001933, #02060f 70%);
+      color: #fff;
+      font-family: "Segoe UI", sans-serif;
+    }
+    canvas {
+      border: 2px solid #007bff;
+      background: #030b20;
+      box-shadow: 0 0 20px rgba(0, 123, 255, 0.4);
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas" width="480" height="640"></canvas>
+  <script>
+    // === 定数定義（ゲームバランス関連） ===
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const WIDTH = canvas.width;
+    const HEIGHT = canvas.height;
+    const PLAYER_SPEED = 260;
+    const SHOT_INTERVAL = 0.15;
+    const SHOT_SPEED = 520;
+    const ENEMY_BULLET_SPEED = 160;
+    const BOSS_BULLET_SPEED = 220;
+    const REFLECT_DURATION = 2;
+    const REFLECT_COOLDOWN = 5;
+    const REFLECT_RADIUS = 120;
+    const WAVE_INTERVAL = 3.5;
+    const BOSS_SPAWN_TIME = 28;
+    const BOSS_HP = 120;
+
+    // === ゲーム状態 ===
+    const keys = {};
+    const player = { x: WIDTH / 2, y: HEIGHT - 80, radius: 16, shotTimer: 0 };
+    let playerShots = [];
+    let enemyBullets = [];
+    let enemies = [];
+    let particles = [];
+    let enemyIdSeed = 0;
+    let reflectActive = false;
+    let reflectTimer = 0;
+    let reflectCooldown = 0;
+    let waveTimer = 0;
+    let totalTime = 0;
+    let bossSpawned = false;
+    let score = 0;
+    let gameOver = false;
+    let gameClear = false;
+    let debugMode = false;
+    let victoryTimer = 0;
+    let audioCtx = null;
+    let explosionBuffer = null;
+    let lastTime = performance.now();
+
+    // === 入力処理 ===
+    window.addEventListener('keydown', (e) => {
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"].includes(e.code)) {
+        e.preventDefault();
+      }
+      primeAudioContext();
+      keys[e.code] = true;
+      if ((e.code === 'ShiftLeft' || e.code === 'ShiftRight') && !gameOver && !gameClear) {
+        activateReflect();
+      }
+      if (e.code === 'KeyD') {
+        debugMode = !debugMode;
+      }
+      if ((gameOver || (gameClear && victoryTimer >= 1)) && e.code === 'Enter') {
+        resetGame();
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      keys[e.code] = false;
+    });
+
+    // === メインループ ===
+    function loop(timestamp) {
+      const delta = Math.min((timestamp - lastTime) / 1000, 0.033);
+      lastTime = timestamp;
+      update(delta);
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    // === 更新処理 ===
+    function update(dt) {
+      if (gameOver) {
+        return;
+      }
+      if (!gameClear) {
+        totalTime += dt;
+        handlePlayerMovement(dt);
+        handleShooting(dt);
+        updateEnemies(dt);
+        updateBullets(dt);
+        spawnWaves(dt);
+        updateReflect(dt);
+      } else {
+        victoryTimer += dt;
+      }
+      updateParticles(dt);
+    }
+
+    // === プレイヤー移動 ===
+    function handlePlayerMovement(dt) {
+      let dx = 0;
+      let dy = 0;
+      if (keys['ArrowLeft']) dx -= 1;
+      if (keys['ArrowRight']) dx += 1;
+      if (keys['ArrowUp']) dy -= 1;
+      if (keys['ArrowDown']) dy += 1;
+      const len = Math.hypot(dx, dy) || 1;
+      player.x += (dx / len) * PLAYER_SPEED * dt;
+      player.y += (dy / len) * PLAYER_SPEED * dt;
+      player.x = Math.max(player.radius, Math.min(WIDTH - player.radius, player.x));
+      player.y = Math.max(player.radius, Math.min(HEIGHT - player.radius, player.y));
+    }
+
+    // === 射撃処理 ===
+    function handleShooting(dt) {
+      player.shotTimer -= dt;
+      if (keys['Space'] && player.shotTimer <= 0) {
+        playerShots.push({
+          x: player.x,
+          y: player.y - 20,
+          vx: 0,
+          vy: -SHOT_SPEED,
+          radius: 4,
+          damage: 1,
+          type: 'normal'
+        });
+        player.shotTimer = SHOT_INTERVAL;
+      }
+    }
+
+    // === 反射シールド処理 ===
+    function activateReflect() {
+      if (reflectActive || reflectCooldown > 0) return;
+      reflectActive = true;
+      reflectTimer = REFLECT_DURATION;
+      reflectCooldown = REFLECT_COOLDOWN;
+    }
+
+    function updateReflect(dt) {
+      if (reflectActive) {
+        reflectTimer -= dt;
+        // 近傍の敵弾を反射弾に変換
+        for (let i = enemyBullets.length - 1; i >= 0; i--) {
+          const b = enemyBullets[i];
+          const dist = Math.hypot(b.x - player.x, b.y - player.y);
+          if (dist <= REFLECT_RADIUS) {
+            playerShots.push(createReflectedShot(b));
+            enemyBullets.splice(i, 1);
+          }
+        }
+        if (reflectTimer <= 0) {
+          reflectActive = false;
+        }
+      } else if (reflectCooldown > 0) {
+        reflectCooldown = Math.max(0, reflectCooldown - dt);
+      }
+    }
+
+    // === 敵ウェーブ生成 ===
+    function spawnWaves(dt) {
+      waveTimer -= dt;
+      if (!bossSpawned && totalTime >= BOSS_SPAWN_TIME) {
+        spawnBoss();
+        bossSpawned = true;
+        return;
+      }
+      if (bossSpawned) {
+        return;
+      }
+      if (waveTimer <= 0) {
+        waveTimer = WAVE_INTERVAL;
+        const count = 5;
+        for (let i = 0; i < count; i++) {
+          const baseX = 60 + i * 80 + Math.random() * 20;
+          enemies.push({
+            id: enemyIdSeed++,
+            x: baseX,
+            y: -40 - i * 20,
+            speed: 60 + Math.random() * 20,
+            hp: 3,
+            phase: Math.random() * Math.PI * 2,
+            shootTimer: 0.8 + Math.random() * 0.7,
+            type: 'grunt'
+          });
+        }
+      }
+    }
+
+    // === 敵更新 ===
+    function updateEnemies(dt) {
+      for (let i = enemies.length - 1; i >= 0; i--) {
+        const enemy = enemies[i];
+        if (enemy.type === 'boss') {
+          updateBoss(enemy, dt);
+        } else {
+          enemy.y += enemy.speed * dt;
+          enemy.x += Math.sin((enemy.phase += dt * 1.5)) * 30 * dt;
+          enemy.shootTimer -= dt;
+          if (enemy.shootTimer <= 0) {
+            shootAtPlayer(enemy);
+            enemy.shootTimer = 0.9 + Math.random() * 0.5;
+          }
+          if (enemy.y > HEIGHT + 50) {
+            enemy.remove = true;
+          }
+        }
+        if (enemy.remove) {
+          enemies.splice(i, 1);
+        }
+      }
+    }
+
+    function shootAtPlayer(enemy) {
+      const dx = player.x - enemy.x;
+      const dy = player.y - enemy.y;
+      const len = Math.hypot(dx, dy) || 1;
+      enemyBullets.push({
+        x: enemy.x,
+        y: enemy.y,
+        vx: (dx / len) * ENEMY_BULLET_SPEED,
+        vy: (dy / len) * ENEMY_BULLET_SPEED,
+        radius: 6,
+        sourceId: enemy.id
+      });
+    }
+
+    // === ボス生成・挙動 ===
+    function spawnBoss() {
+      enemies.push({
+        id: enemyIdSeed++,
+        type: 'boss',
+        x: WIDTH / 2,
+        y: -120,
+        speed: 50,
+        hp: BOSS_HP,
+        phase: 0,
+        shootTimer: 1.2,
+        entered: false
+      });
+    }
+
+    function updateBoss(enemy, dt) {
+      if (enemy.dying) {
+        enemy.deathTimer += dt;
+        enemy.y += enemy.fallSpeed * dt;
+        enemy.fallSpeed += 18 * dt;
+        enemy.phase += dt * 4;
+        if (Math.random() < dt * 10) {
+          createTrailSpark(enemy);
+        }
+        if (enemy.deathTimer >= 4 || enemy.y >= HEIGHT - 60) {
+          finalizeBoss(enemy);
+        }
+        return;
+      }
+      if (!enemy.entered) {
+        enemy.y += enemy.speed * dt;
+        if (enemy.y >= 120) {
+          enemy.entered = true;
+        }
+      } else {
+        enemy.x = WIDTH / 2 + Math.sin((enemy.phase += dt)) * 140;
+      }
+      enemy.shootTimer -= dt;
+      if (enemy.shootTimer <= 0) {
+        bossShoot(enemy);
+        enemy.shootTimer = 0.8;
+      }
+    }
+
+    function bossShoot(enemy) {
+      // 放射状弾
+      const ringCount = 8;
+      for (let i = 0; i < ringCount; i++) {
+        const angle = (Math.PI * 2 * i) / ringCount + enemy.phase * 0.2;
+        enemyBullets.push({
+          x: enemy.x,
+          y: enemy.y,
+          vx: Math.cos(angle) * BOSS_BULLET_SPEED,
+          vy: Math.sin(angle) * BOSS_BULLET_SPEED,
+          radius: 7,
+          sourceId: enemy.id
+        });
+      }
+      // プレイヤー狙い扇形
+      const aimAngle = Math.atan2(player.y - enemy.y, player.x - enemy.x);
+      for (let j = -1; j <= 1; j++) {
+        const angle = aimAngle + j * 0.2;
+        enemyBullets.push({
+          x: enemy.x,
+          y: enemy.y,
+          vx: Math.cos(angle) * (ENEMY_BULLET_SPEED + 40),
+          vy: Math.sin(angle) * (ENEMY_BULLET_SPEED + 40),
+          radius: 6,
+          sourceId: enemy.id
+        });
+      }
+    }
+
+    // === 弾更新 ===
+    function updateBullets(dt) {
+      for (let i = playerShots.length - 1; i >= 0; i--) {
+        const shot = playerShots[i];
+        shot.x += shot.vx * dt;
+        shot.y += shot.vy * dt;
+        if (
+          shot.y < -40 ||
+          shot.y > HEIGHT + 40 ||
+          shot.x < -40 ||
+          shot.x > WIDTH + 40
+        ) {
+          playerShots.splice(i, 1);
+          continue;
+        }
+        for (let j = enemies.length - 1; j >= 0; j--) {
+          const enemy = enemies[j];
+          if (circleHit(shot, enemy, enemyRadius(enemy))) {
+            enemy.hp -= shot.damage;
+            playerShots.splice(i, 1);
+            createExplosion(enemy.x, enemy.y);
+            if (enemy.hp <= 0) {
+              if (enemy.type === 'boss') {
+                if (!enemy.dying) {
+                  score += 2000;
+                  startBossDeath(enemy);
+                }
+              } else {
+                score += 100;
+                enemies.splice(j, 1);
+                playExplosionSound(1 + Math.random() * 0.3, 0.35);
+              }
+            } else {
+              score += enemy.type === 'boss' ? 60 : 20;
+            }
+            break;
+          }
+        }
+      }
+
+      for (let i = enemyBullets.length - 1; i >= 0; i--) {
+        const bullet = enemyBullets[i];
+        bullet.x += bullet.vx * dt;
+        bullet.y += bullet.vy * dt;
+        if (bullet.y > HEIGHT + 40 || bullet.y < -40 || bullet.x < -40 || bullet.x > WIDTH + 40) {
+          enemyBullets.splice(i, 1);
+          continue;
+        }
+        if (!debugMode && !gameClear && circleHit(bullet, player, player.radius)) {
+          gameOver = true;
+        }
+      }
+    }
+
+    // === エフェクト ===
+    function createExplosion(x, y) {
+      for (let k = 0; k < 6; k++) {
+        particles.push({
+          x,
+          y,
+          vx: (Math.random() - 0.5) * 80,
+          vy: (Math.random() - 0.5) * 80,
+          life: 0.4 + Math.random() * 0.3
+        });
+      }
+    }
+
+    function createMegaExplosion(x, y) {
+      for (let ring = 0; ring < 3; ring++) {
+        for (let a = 0; a < Math.PI * 2; a += Math.PI / 6) {
+          particles.push({
+            x,
+            y,
+            vx: Math.cos(a) * (80 + ring * 40 + Math.random() * 20),
+            vy: Math.sin(a) * (80 + ring * 40 + Math.random() * 20),
+            life: 0.8 + Math.random() * 0.6
+          });
+        }
+      }
+      for (let i = 0; i < 12; i++) {
+        createExplosion(x + (Math.random() - 0.5) * 60, y + (Math.random() - 0.5) * 60);
+      }
+    }
+
+    function createTrailSpark(enemy) {
+      particles.push({
+        x: enemy.x + (Math.random() - 0.5) * enemyRadius(enemy) * 2,
+        y: enemy.y + (Math.random() - 0.5) * enemyRadius(enemy) * 2,
+        vx: (Math.random() - 0.5) * 50,
+        vy: (Math.random() - 0.5) * 50 + 30,
+        life: 0.5 + Math.random() * 0.4
+      });
+    }
+
+    function updateParticles(dt) {
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.life -= dt;
+        if (p.life <= 0) {
+          particles.splice(i, 1);
+        }
+      }
+    }
+
+    // === 衝突判定ヘルパー ===
+    function circleHit(a, b, radius) {
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      return dist < (a.radius + radius);
+    }
+
+    function enemyRadius(enemy) {
+      return enemy.type === 'boss' ? 34 : 18;
+    }
+
+    function findEnemyById(id) {
+      return enemies.find((e) => e.id === id);
+    }
+
+    function startBossDeath(enemy) {
+      enemy.hp = 0;
+      enemy.dying = true;
+      enemy.deathTimer = 0;
+      enemy.fallSpeed = 30;
+      enemy.phase += Math.PI / 6;
+      enemy.shootTimer = Infinity;
+      playExplosionSound(0.6, 0.6);
+    }
+
+    function finalizeBoss(enemy) {
+      createMegaExplosion(enemy.x, enemy.y);
+      enemyBullets = [];
+      playerShots = [];
+      playExplosionSound(0.5, 0.9);
+      gameClear = true;
+      victoryTimer = 0;
+      enemy.remove = true;
+    }
+
+    function createReflectedShot(bullet) {
+      const target = findEnemyById(bullet.sourceId);
+      const speed = SHOT_SPEED * 0.9;
+      let vx = 0;
+      let vy = -speed;
+      if (target) {
+        const dx = target.x - bullet.x;
+        const dy = target.y - bullet.y;
+        const len = Math.hypot(dx, dy) || 1;
+        vx = (dx / len) * speed;
+        vy = (dy / len) * speed;
+      }
+      return {
+        x: bullet.x,
+        y: bullet.y,
+        vx,
+        vy,
+        radius: 6,
+        damage: target && target.type === 'boss' ? 4 : 2,
+        type: 'reflect'
+      };
+    }
+
+    // === オーディオ関連 ===
+    function primeAudioContext() {
+      if (!window.AudioContext && !window.webkitAudioContext) {
+        return;
+      }
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+    }
+
+    function ensureExplosionBuffer() {
+      primeAudioContext();
+      if (!audioCtx || explosionBuffer) return;
+      const duration = 0.35;
+      explosionBuffer = audioCtx.createBuffer(1, audioCtx.sampleRate * duration, audioCtx.sampleRate);
+      const data = explosionBuffer.getChannelData(0);
+      for (let i = 0; i < data.length; i++) {
+        const progress = i / data.length;
+        const envelope = Math.pow(1 - progress, 3);
+        data[i] = (Math.random() * 2 - 1) * envelope;
+      }
+    }
+
+    function playExplosionSound(pitch = 1, volume = 0.4) {
+      ensureExplosionBuffer();
+      if (!audioCtx || !explosionBuffer) return;
+      const source = audioCtx.createBufferSource();
+      source.buffer = explosionBuffer;
+      source.playbackRate.value = pitch;
+      const filter = audioCtx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 500 + pitch * 300;
+      const gain = audioCtx.createGain();
+      gain.gain.value = volume;
+      source.connect(filter).connect(gain).connect(audioCtx.destination);
+      source.start(0);
+    }
+
+    // === 描画処理 ===
+    function draw() {
+      ctx.clearRect(0, 0, WIDTH, HEIGHT);
+
+      // 背景の流れるライン
+      ctx.fillStyle = '#04122b';
+      ctx.fillRect(0, 0, WIDTH, HEIGHT);
+      const stripeCount = 15;
+      for (let i = 0; i < stripeCount; i++) {
+        const y = ((Date.now() / 5 + i * 40) % HEIGHT);
+        ctx.fillStyle = 'rgba(0, 123, 255, 0.07)';
+        ctx.fillRect(0, y, WIDTH, 6);
+      }
+
+      // 反射シールド範囲
+      if (reflectActive) {
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, REFLECT_RADIUS, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(0, 200, 255, 0.4)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      // プレイヤー（三角形）
+      ctx.fillStyle = '#4af0ff';
+      ctx.beginPath();
+      ctx.moveTo(player.x, player.y - player.radius);
+      ctx.lineTo(player.x - player.radius, player.y + player.radius);
+      ctx.lineTo(player.x + player.radius, player.y + player.radius);
+      ctx.closePath();
+      ctx.fill();
+
+      // プレイヤー弾
+      for (const shot of playerShots) {
+        ctx.fillStyle = shot.type === 'reflect' ? '#f5d547' : '#7df9ff';
+        ctx.beginPath();
+        ctx.arc(shot.x, shot.y, shot.radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // 敵弾
+      ctx.fillStyle = '#ff3b3b';
+      for (const bullet of enemyBullets) {
+        ctx.beginPath();
+        ctx.arc(bullet.x, bullet.y, bullet.radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // 敵描画
+      for (const enemy of enemies) {
+        if (enemy.type === 'boss') {
+          ctx.fillStyle = '#ff7ab8';
+          ctx.beginPath();
+          for (let i = 0; i < 6; i++) {
+            const angle = (Math.PI / 3) * i + enemy.phase * 0.2;
+            const rx = enemy.x + Math.cos(angle) * enemyRadius(enemy);
+            const ry = enemy.y + Math.sin(angle) * enemyRadius(enemy);
+            if (i === 0) ctx.moveTo(rx, ry);
+            else ctx.lineTo(rx, ry);
+          }
+          ctx.closePath();
+          ctx.fill();
+        } else {
+          ctx.fillStyle = '#f7b267';
+          ctx.beginPath();
+          ctx.moveTo(enemy.x, enemy.y + enemyRadius(enemy));
+          ctx.lineTo(enemy.x - enemyRadius(enemy), enemy.y - enemyRadius(enemy));
+          ctx.lineTo(enemy.x + enemyRadius(enemy), enemy.y - enemyRadius(enemy));
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+
+      // パーティクル
+      ctx.fillStyle = '#ffd27d';
+      for (const p of particles) {
+        ctx.globalAlpha = Math.max(0, p.life / 0.5);
+        ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+      }
+      ctx.globalAlpha = 1;
+
+      // UI描画
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '16px "Segoe UI", sans-serif';
+      ctx.fillText(`SCORE: ${score}`, 16, 24);
+      const cooldownText = reflectActive
+        ? 'REFLECT: ACTIVE'
+        : reflectCooldown > 0
+          ? `REFLECT: ${reflectCooldown.toFixed(1)}s`
+          : 'REFLECT: READY';
+      ctx.fillText(cooldownText, 16, 46);
+      const boss = enemies.find((e) => e.type === 'boss');
+      if (boss) {
+        ctx.textAlign = 'right';
+        ctx.fillText(`BOSS HP: ${Math.max(0, Math.floor(boss.hp))}`, WIDTH - 16, 24);
+        ctx.textAlign = 'left';
+      }
+      if (debugMode) {
+        ctx.fillStyle = '#6cff96';
+        ctx.font = '14px "Segoe UI", sans-serif';
+        ctx.fillText('DEBUG MODE: INVINCIBLE', 16, 66);
+      }
+      if (gameClear) {
+        const ready = victoryTimer >= 1;
+        if (ready) {
+          ctx.fillStyle = '#7dffda';
+          ctx.font = '32px "Segoe UI", sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('GAME CLEAR', WIDTH / 2, HEIGHT / 2 - 20);
+          ctx.font = '16px "Segoe UI", sans-serif';
+          ctx.fillText('Press Enter to restart', WIDTH / 2, HEIGHT / 2 + 10);
+          ctx.textAlign = 'left';
+        }
+      } else if (gameOver) {
+        ctx.fillStyle = '#ff5f5f';
+        ctx.font = '28px "Segoe UI", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', WIDTH / 2, HEIGHT / 2 - 10);
+        ctx.font = '16px "Segoe UI", sans-serif';
+        ctx.fillText('Press Enter to restart', WIDTH / 2, HEIGHT / 2 + 20);
+        ctx.textAlign = 'left';
+      }
+    }
+
+    // === リセット処理 ===
+    function resetGame() {
+      player.x = WIDTH / 2;
+      player.y = HEIGHT - 80;
+      player.shotTimer = 0;
+      playerShots = [];
+      enemyBullets = [];
+      enemies = [];
+      particles = [];
+      enemyIdSeed = 0;
+      reflectActive = false;
+      reflectTimer = 0;
+      reflectCooldown = 0;
+      waveTimer = 0;
+      totalTime = 0;
+      bossSpawned = false;
+      score = 0;
+      gameOver = false;
+      gameClear = false;
+      debugMode = false;
+      victoryTimer = 0;
+    }
+
+    // === 初期化 ===
+    resetGame();
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
