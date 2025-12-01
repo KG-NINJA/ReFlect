@@ -62,6 +62,8 @@
     let victoryTimer = 0;
     let audioCtx = null;
     let explosionBuffer = null;
+    let reflectBuffer = null;
+    let pingBuffer = null;
     let lastTime = performance.now();
 
     // === 入力処理 ===
@@ -152,6 +154,7 @@
       reflectActive = true;
       reflectTimer = REFLECT_DURATION;
       reflectCooldown = REFLECT_COOLDOWN;
+      playReflectSound();
     }
 
     function updateReflect(dt) {
@@ -164,6 +167,7 @@
           if (dist <= REFLECT_RADIUS) {
             playerShots.push(createReflectedShot(b));
             enemyBullets.splice(i, 1);
+            playPingSound();
           }
         }
         if (reflectTimer <= 0) {
@@ -251,6 +255,7 @@
         y: -120,
         speed: 50,
         hp: BOSS_HP,
+        maxHp: BOSS_HP,
         phase: 0,
         shootTimer: 1.2,
         entered: false
@@ -263,6 +268,11 @@
         enemy.y += enemy.fallSpeed * dt;
         enemy.fallSpeed += 18 * dt;
         enemy.phase += dt * 4;
+        enemy.deathSoundTimer -= dt;
+        if (enemy.deathSoundTimer <= 0) {
+          playExplosionSound(1 + Math.random() * 0.4, 0.35);
+          enemy.deathSoundTimer = 0.18 + Math.random() * 0.12;
+        }
         if (Math.random() < dt * 10) {
           createTrailSpark(enemy);
         }
@@ -442,6 +452,7 @@
       enemy.fallSpeed = 30;
       enemy.phase += Math.PI / 6;
       enemy.shootTimer = Infinity;
+      enemy.deathSoundTimer = 0;
       playExplosionSound(0.6, 0.6);
     }
 
@@ -449,7 +460,7 @@
       createMegaExplosion(enemy.x, enemy.y);
       enemyBullets = [];
       playerShots = [];
-      playExplosionSound(0.5, 0.9);
+      playExplosionSound(0.75, 1.4);
       gameClear = true;
       victoryTimer = 0;
       enemy.remove = true;
@@ -516,6 +527,60 @@
       const gain = audioCtx.createGain();
       gain.gain.value = volume;
       source.connect(filter).connect(gain).connect(audioCtx.destination);
+      source.start(0);
+    }
+
+    function ensureReflectBuffer() {
+      primeAudioContext();
+      if (!audioCtx || reflectBuffer) return;
+      const duration = 0.32;
+      reflectBuffer = audioCtx.createBuffer(1, audioCtx.sampleRate * duration, audioCtx.sampleRate);
+      const data = reflectBuffer.getChannelData(0);
+      for (let i = 0; i < data.length; i++) {
+        const t = i / audioCtx.sampleRate;
+        const sweep = Math.sin(2 * Math.PI * (250 + t * 1500) * t);
+        const chime = Math.sin(2 * Math.PI * 1400 * t) * Math.pow(1 - t / duration, 1.5);
+        const shimmer = (Math.random() * 2 - 1) * 0.2 * (1 - t / duration);
+        data[i] = (sweep * 0.6 + chime * 0.5 + shimmer);
+      }
+    }
+
+    function playReflectSound() {
+      ensureReflectBuffer();
+      if (!audioCtx || !reflectBuffer) return;
+      const source = audioCtx.createBufferSource();
+      source.buffer = reflectBuffer;
+      const filter = audioCtx.createBiquadFilter();
+      filter.type = 'bandpass';
+      filter.frequency.value = 900;
+      filter.Q.value = 2;
+      const gain = audioCtx.createGain();
+      gain.gain.value = 0.8;
+      source.connect(filter).connect(gain).connect(audioCtx.destination);
+      source.start(0);
+    }
+
+    function ensurePingBuffer() {
+      primeAudioContext();
+      if (!audioCtx || pingBuffer) return;
+      const duration = 0.12;
+      pingBuffer = audioCtx.createBuffer(1, audioCtx.sampleRate * duration, audioCtx.sampleRate);
+      const data = pingBuffer.getChannelData(0);
+      for (let i = 0; i < data.length; i++) {
+        const t = i / audioCtx.sampleRate;
+        const env = Math.pow(1 - t / duration, 2);
+        data[i] = Math.sin(2 * Math.PI * 1500 * t) * env;
+      }
+    }
+
+    function playPingSound() {
+      ensurePingBuffer();
+      if (!audioCtx || !pingBuffer) return;
+      const source = audioCtx.createBufferSource();
+      source.buffer = pingBuffer;
+      const gain = audioCtx.createGain();
+      gain.gain.value = 0.35;
+      source.connect(gain).connect(audioCtx.destination);
       source.start(0);
     }
 
@@ -615,6 +680,21 @@
         ctx.textAlign = 'right';
         ctx.fillText(`BOSS HP: ${Math.max(0, Math.floor(boss.hp))}`, WIDTH - 16, 24);
         ctx.textAlign = 'left';
+        const barWidth = 260;
+        const barHeight = 12;
+        const barX = WIDTH / 2 - barWidth / 2;
+        const barY = 70;
+        const ratio = Math.max(0, Math.min(1, boss.hp / (boss.maxHp || BOSS_HP)));
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.fillRect(barX, barY, barWidth, barHeight);
+        const gradient = ctx.createLinearGradient(barX, barY, barX + barWidth, barY);
+        gradient.addColorStop(0, '#ff8abe');
+        gradient.addColorStop(1, '#ffa05b');
+        ctx.fillStyle = gradient;
+        ctx.fillRect(barX, barY, barWidth * ratio, barHeight);
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(barX, barY, barWidth, barHeight);
       }
       if (debugMode) {
         ctx.fillStyle = '#6cff96';
